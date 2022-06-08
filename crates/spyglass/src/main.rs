@@ -1,17 +1,21 @@
 extern crate notify;
 
+//use crate::importer::FirefoxImporter;
+use entities::models::crawl_queue::{self, remove_by_rule};
+use entities::models::indexed_document;
+use entities::regex::{regex_for_robots, WildcardType};
+use entities::sea_orm::DatabaseConnection;
+use libspyglass::search::Searcher;
+use libspyglass::state::AppState;
+use libspyglass::task::{self, AppShutdown};
+use migration::{Migrator, MigratorTrait};
+use shared::config::{Config, UserSettings};
 use std::io;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::{broadcast, mpsc};
 use tracing_log::LogTracer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
-
-use entities::models::crawl_queue;
-use libspyglass::state::AppState;
-use libspyglass::task::{self, AppShutdown};
-use migration::{Migrator, MigratorTrait};
-use shared::config::Config;
 
 mod api;
 mod importer;
@@ -73,6 +77,7 @@ async fn start_backend(state: &AppState, config: &Config) {
     //     let _ = importer.import(&state).await;
     // }
 
+    clear_settings_blocked(&state.db, &state.index, &config.user_settings).await;
     // Initialize crawl_queue, set all in-flight tasks to queued.
     crawl_queue::reset_processing(&state.db).await;
 
@@ -137,4 +142,36 @@ async fn start_backend(state: &AppState, config: &Config) {
     }
 
     let _ = tokio::join!(manager_handle, worker_handle);
+}
+
+pub async fn clear_settings_blocked(
+    db: &DatabaseConnection,
+    index: &Searcher,
+    settings: &UserSettings,
+) {
+    for domain in settings.block_list.iter() {
+        let domain = if domain.starts_with("*.") {
+            domain.to_string()
+        } else {
+            format!("*{domain}")
+        };
+        if let Some(rule_like) = regex_for_robots(&domain, WildcardType::Database) {
+            // Remove matching crawl tasks
+            let _ = remove_by_rule(&db, &rule_like).await;
+            // Remove matching indexed documents
+            match indexed_document::remove_by_rule(&db, &rule_like).await {
+                Ok(doc_ids) => {
+                    if let Ok(mut writer) = index.writer.lock() {
+                        for doc_id in doc_ids {
+                            let res = Searcher::delete(&mut writer, &doc_id);
+                            if let Err(err) = res {
+                                log::error!("Unable to remove docs: {:?}", err);
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::error!("Unable to remove docs: {:?}", e),
+            }
+        }
+    }
 }
